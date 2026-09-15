@@ -1,6 +1,6 @@
 # MUSA (S5000) vLLM 0.24 适配问题调查报告
 
-- 首版：2026-09-09 ～ 2026-09-10；**v2 修订：2026-09-15**（补全所有问题的原始报错日志摘录、逐步现象描述与精确复现步骤；修正证据保存位置；补充宿主机状态复查结论）
+- 首版：2026-09-09 ～ 2026-09-10；**v2 修订：2026-09-15**（补全所有问题的原始报错日志摘录、逐步现象描述与精确复现步骤；修正证据保存位置；补充宿主机状态复查结论）；**v2.1 修订：2026-09-15**（§4 问题③并入厂商侧根因定位：FlagTree `tl.device_assert` lowering 性能问题）
 - 复现环境（逐项可核对）：
   - 宿主机 `bm-mthreads-bjsjq-zone1-moer-s5000-80g-38-23`，MTT S5000 ×8（每卡 81920MiB），mthreads-gmi 2.3.2 / Driver 3.3.5-server，Ubuntu 22.04（容器内 python3.10.12）
   - **宿主机自 2026-06-27 22:54 起未重启**（`uptime -s` 实测），登录横幅持续提示 `*** System restart required ***`
@@ -8,7 +8,7 @@
     （vLLM 0.24.0+empty / torch 2.9.0 / torch_musa 2.9.0 / FlagGems 5.3.2.post1.dev22+gb1f939eb5 / flagtree 0.6.0+mthreads3.6）
   - 插件侧：flagos-ai/vllm-plugin-FL，PR #457（本报告随该 PR 交付，报告本身不含任何运行时 py 改动）
 - 证据文件：宿主机 `/root/fl-musa-evidence/`（14 个文件，2026-09-15 经 `docker cp` 从容器 `musa-024-e2e` 导出；**首版报告"已备份宿主机"的表述有误**——当时的备份命令实际把文件留在了容器内，现已真正导出并双份保存）；复现脚本：宿主机 `/root/scripts_debug/`、`/root/tp_test.py`（均从容器导出）
-- 结论速览：**五个故障模式，根因均不在插件层；①③④⑤归属摩尔（torch_musa/驱动），②一半归属 vLLM 上游、一半归属摩尔**。插件层无法根修，只能按 §0 的映射显式收缩测试面并等待根修。
+- 结论速览：**五个故障模式，根因均不在插件层；①④⑤归属摩尔（torch_musa/驱动），③归属摩尔/FlagTree（`tl.device_assert`，厂商已定位），②一半归属 vLLM 上游、一半归属摩尔**。插件层无法根修，只能按 §0 的映射显式收缩测试面并等待根修。
 
 ---
 
@@ -20,7 +20,7 @@
 | e2e serving `qwen3_6/35b_a3b_tp4_eager`（vendor 原有用例） | TP4 serving | ①＋② | ②修复可先恢复 serving 框架，①修复后恢复 TP4 |
 | e2e serving 任务整体 | `tests/platforms/musa.yaml` serving 段 | ②（`vllm serve` 无法启动） | vLLM 上游或 torch_musa 任一方修复 fork 冲突 |
 | benchmark（serve smoke 三件套） | `benchmark.enabled: true` | ②（`vllm bench serve` 同样要起服务） | 同上 |
-| `enforce_eager=False` 变体 | `06b_tp1.yaml` parametrize `[true, false]` | ③（图模式捕获挂死） | 摩尔修复捕获路径后恢复 `[true, false]` |
+| `enforce_eager=False` 变体 | `06b_tp1.yaml` parametrize `[true, false]` | ③（FlagTree `tl.device_assert` 导致 autotune 极慢） | flagtree 修复/升级已修复版本（§4）后恢复 `[true, false]` |
 | 多卡矩阵（现仅保留 `qwen3/06b_tp1` 单卡） | 原 TP4 矩阵 | ①（⑤在诊断中亦拦路，可用 `disable_custom_all_reduce=true` 绕） | 同① |
 
 > 设计说明：以上收缩全部是**显式**的——`tests/platforms/musa.yaml` 内注释逐条标注问题编号，PR 描述与本报告互相引用；没有任何无痕跳过。当前保留的测试面（unit + functional + TP1 eager 推理 e2e）全部真实执行且通过（09-14 CI run 34815101547 全绿）。
@@ -31,7 +31,7 @@
 |---|---|---|---|---|
 | ① | TP≥2 权重加载挂死（rank≥1 用户态自旋） | 09-09 | 09-09 必现；09-10 漂移为④⑤（见 §6） | 未复测（建议按 §2 步骤在重启后的宿主机复测） |
 | ② | `vllm serve` 启动失败：fork 冲突 | 09-09 | 稳定复现（3 秒内退出） | 机制未变（版本未升级） |
-| ③ | 图模式（torch.compile + PIECEWISE cudagraph）捕获挂死 | 09-10 CI | 干净 runner 必现（60 分钟零输出直至超时） | 未复测 |
+| ③ | 图模式（torch.compile + PIECEWISE cudagraph）捕获挂死 | 09-10 CI | 干净 runner 必现（60 分钟零输出直至超时） | **厂商已定位：FlagTree `tl.device_assert` 极慢（见 §4）** |
 | ④ | TP2 `profile_run` dummy 前向 **illegal memory access** | 09-10 | 当日两次复现，每次崩溃后泄漏 ~70GB 显存 | 设备现已干净（见 §5 修正） |
 | ⑤ | init 期 `can_device_access_peer` 断言 | 09-10 | 状态依赖 | 未复测 |
 
@@ -187,9 +187,12 @@ EOF
 # 预期：打出 template_heuristics fallback 告警后无限静默（对照：enforce_eager=True 数秒出结果）
 ```
 
-**原理**：慢编译不可能 58 分钟一行不吐——是 musa 上 inductor 编译路径的挂死而非慢。所有摩尔官方 musa 用例均带 `_eager` 后缀，与此一致。
-**Owner**：摩尔（torch_musa 编译/捕获路径）。
-**潜在解法**：临时 = eager-only（已采用；属 vendor 官方形态，非吞问题）；根修 = 摩尔排查 inductor musa 模板 fallback 后的编译挂死。
+**原理（v2.1 修订：根因已由厂商侧定位）**：
+- **厂商侧结论（邓伟，08-27，早于本报告首版）**：问题收敛到 **MUSA/FlagTree 后端的 `tl.device_assert`**——单独测试 `synchronize()` 和普通 `do_bench()` 都正常快速返回；对**同一个** Inductor 生成 kernel 做 A/B：保留 `tl.device_assert` 的 autotune 耗时 **~44.5 秒**，去掉该行后降到 **~0 秒（0.015ms）**，差距约 **36 万倍**；独立最小复现一致。即 **vLLM、MCCL、do_bench 本身无问题**。
+- 与本报告证据吻合：静默始于 inductor 开始编译首个 musa 模板（`triton::mm` fallback 告警后），每个含 device_assert 的 kernel autotune ~44.5s，57 分 28 秒静默 ≈ 数十个 kernel 的 autotune 串行总和。**据此修正首版"挂死而非慢"的判断：是极端慢，不是死锁**——且推论是即便加大 CI 超时，真实模型也永远跑不完编译阶段。
+- 处置（王凌霄，08-27）：参考 FlagTree wiki（`User-manual-for-mthreads`）从最新源码重装 flagtree 复测；若仍复现则反馈 flagtree 团队。
+**Owner（修订）**：摩尔/FlagTree（`tl.device_assert` 的实现或 lowering）；vLLM、MCCL、do_bench 已排除。
+**潜在解法**：临时 = eager-only（已采用；属 vendor 官方形态，非吞问题）；根修 = flagtree 修复 device_assert lowering，或升级到已含修复的 flagtree 版本后在容器内重跑本节复现步骤验证。
 
 ---
 
