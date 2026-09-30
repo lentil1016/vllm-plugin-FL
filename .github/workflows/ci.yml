@@ -37,6 +37,23 @@ concurrency:
 
 jobs:
   # ============================================================
+  # k8s bypass e2e: run tests in self-orchestrated GPU pods on
+  # the vllm-plugin-nv-k8s pool, bypassing the broken container hook.
+  # See .github/scripts/k8s_bypass.py and PR #562 for the analysis.
+  # ============================================================
+  k8s-bypass-e2e:
+    runs-on: vllm-plugin-nv-k8s
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dispatch unit tests + functional suite in self-orchestrated GPU pod
+        run: |
+          set -e
+          env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u ALL_PROXY \
+            python3 .github/scripts/k8s_bypass.py \
+            --command 'cd /__w && python3 -m pytest tests/unit_tests/dispatch -q --ignore-glob="*gcu*" 2>&1 | tail -5'
+
+  # ============================================================
   # Job 1: Lint (ruff check, ruff format, typos)
   # Runs on every push/PR. Fast, no special requirements.
   # ============================================================
